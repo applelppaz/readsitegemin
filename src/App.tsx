@@ -12,7 +12,8 @@ export default function App() {
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"tokens" | "style" | "patterns">("tokens");
-  
+  const [extractionStats, setExtractionStats] = useState<{ charCount: number; paragraphCount: number } | null>(null);
+
   const handleFetch = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!url) return;
@@ -22,6 +23,7 @@ export default function App() {
     setResult(null);
     setFullText("");
     setSelectedIndex(null);
+    setExtractionStats(null);
 
     try {
       const response = await fetch("/api/fetch-url", {
@@ -35,8 +37,9 @@ export default function App() {
         throw new Error(data.error || "Failed to fetch URL");
       }
 
-      const { text } = await response.json();
+      const { text, charCount, paragraphCount } = await response.json();
       setFullText(text);
+      setExtractionStats({ charCount, paragraphCount });
       const analysis = await analyzeText(text);
       setResult(analysis);
     } catch (err: any) {
@@ -161,6 +164,20 @@ export default function App() {
         )}
 
         {result && (
+          <div className="space-y-4">
+            {result.partialAnalysis && (
+              <div className="bg-amber-50 border border-amber-200 text-amber-700 px-4 py-3 rounded-2xl flex items-center gap-3">
+                <Info size={20} className="shrink-0" />
+                <p>API制限により一部のテキストのみ分析されました（{result.analyzedChunks}/{result.totalChunks}チャンク）。残りは省略されています。</p>
+              </div>
+            )}
+
+            {extractionStats && (
+              <div className="text-xs text-stone-400 text-right">
+                抽出: {extractionStats.charCount.toLocaleString()}文字 / {extractionStats.paragraphCount}段落
+              </div>
+            )}
+
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
             {/* Left Column: Content & Analysis */}
             <div className="lg:col-span-8 space-y-8">
@@ -354,6 +371,7 @@ export default function App() {
                 </AnimatePresence>
               </div>
             </aside>
+          </div>
           </div>
         )}
       </main>

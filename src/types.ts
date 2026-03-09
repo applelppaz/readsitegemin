@@ -26,4 +26,7 @@ export interface AnalysisResult {
   culturalContext: string;
   sentencePatterns: SentencePattern[];
   tokens: Token[];
+  partialAnalysis?: boolean;
+  analyzedChunks?: number;
+  totalChunks?: number;
 }

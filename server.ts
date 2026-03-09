@@ -6,7 +6,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
-async function withRetry<T>(fn: () => Promise<T>, maxRetries = 5): Promise<T> {
+async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
   let lastError: any;
   for (let i = 0; i < maxRetries; i++) {
     try {
@@ -18,8 +18,8 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 5): Promise<T> {
       const isOverloaded = errorMessage.includes("503") || errorMessage.includes("overloaded");
 
       if ((isRateLimit || isOverloaded) && i < maxRetries - 1) {
-        const delay = Math.pow(2, i) * 3000 + Math.random() * 1000;
-        console.warn(`Gemini API busy (Attempt ${i + 1}/${maxRetries}), retrying in ${Math.round(delay)}ms...`);
+        const delay = Math.pow(3, i) * 10000 + Math.random() * 5000;
+        console.warn(`Gemini API rate limited (Attempt ${i + 1}/${maxRetries}), retrying in ${Math.round(delay / 1000)}s...`);
         await new Promise(resolve => setTimeout(resolve, delay));
         continue;
       }
@@ -27,6 +27,51 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 5): Promise<T> {
     }
   }
   throw lastError;
+}
+
+function splitIntoChunks(text: string, maxChunkSize: number): string[] {
+  const chunks: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= maxChunkSize) {
+      chunks.push(remaining);
+      break;
+    }
+
+    // Look for the last sentence boundary within the chunk size limit
+    // Search in the last 30% of the window for a sentence-ending character
+    const searchStart = Math.floor(maxChunkSize * 0.7);
+    const searchRegion = remaining.substring(searchStart, maxChunkSize);
+
+    // Match sentence-ending punctuation (Western + CJK) followed by optional whitespace
+    let splitAt = maxChunkSize;
+    const sentenceEndRegex = /[.!?。！？\n]/g;
+    let lastMatch: RegExpExecArray | null = null;
+    let match: RegExpExecArray | null;
+    while ((match = sentenceEndRegex.exec(searchRegion)) !== null) {
+      lastMatch = match;
+    }
+
+    if (lastMatch) {
+      splitAt = searchStart + lastMatch.index + lastMatch[0].length;
+      // Skip trailing whitespace after the sentence end
+      while (splitAt < remaining.length && /\s/.test(remaining[splitAt])) {
+        splitAt++;
+      }
+    } else {
+      // Fallback: split at last whitespace
+      const lastSpace = remaining.lastIndexOf(" ", maxChunkSize);
+      if (lastSpace > maxChunkSize * 0.5) {
+        splitAt = lastSpace + 1;
+      }
+    }
+
+    chunks.push(remaining.substring(0, splitAt));
+    remaining = remaining.substring(splitAt);
+  }
+
+  return chunks;
 }
 
 async function startServer() {
@@ -48,7 +93,7 @@ async function startServer() {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
       });
-      
+
       if (!response.ok) {
         throw new Error(`Failed to fetch URL: ${response.statusText}`);
       }
@@ -56,39 +101,87 @@ async function startServer() {
       const html = await response.text();
       const $ = cheerio.load(html);
 
-      // Remove scripts, styles, and other non-content elements
-      $("script, style, nav, footer, iframe, noscript, header, aside, .nav, .footer, .header, .sidebar, .menu, .ads, .advertisement").remove();
+      // Remove non-content elements
+      $(
+        "script, style, noscript, iframe, svg, canvas, " +
+        "nav, footer, header, aside, " +
+        "[role='navigation'], [role='banner'], [role='contentinfo'], [role='complementary'], " +
+        ".nav, .footer, .header, .sidebar, .menu, .ads, .advertisement, .ad, .social-share, " +
+        ".related-posts, .comments, .comment-section, #comments, " +
+        "form, button, input, select, textarea"
+      ).remove();
 
-      // Try to find the main content area
-      let contentElement = $("article, main, section, [role='main'], .content, #content, .post, .article, .entry-content, .main-content").first();
-      
-      // If no specific content area found, use body
-      if (contentElement.length === 0) {
-        contentElement = $("body");
+      // Find the best content element by selecting the one with the most text
+      const candidates = [
+        "article", "main", "[role='main']", ".post-content",
+        ".entry-content", ".article-body", ".story-body", ".content",
+        "#content", ".post", ".article", ".main-content"
+      ];
+
+      let contentElement: cheerio.Cheerio<any> = $("body");
+      let maxLen = 0;
+
+      for (const selector of candidates) {
+        const el = $(selector);
+        if (el.length > 0) {
+          const len = el.first().text().length;
+          if (len > maxLen) {
+            maxLen = len;
+            contentElement = el.first();
+          }
+        }
       }
 
-      // Extract text while preserving some structure (newlines for paragraphs)
-      // We can iterate over block elements and add newlines
+      // Extract text from leaf-level block elements to avoid duplication
+      const blockTags = new Set([
+        "p", "h1", "h2", "h3", "h4", "h5", "h6", "li",
+        "blockquote", "figcaption", "td", "th", "dt", "dd", "pre"
+      ]);
+
       let extractedText = "";
-      contentElement.find("p, h1, h2, h3, h4, h5, h6, li, div").each((_, el) => {
-        const text = $(el).text().trim();
-        if (text) {
-          extractedText += text + "\n\n";
+      contentElement.find("*").each((_, el) => {
+        const tagName = (el as any).tagName?.toLowerCase();
+        if (!tagName) return;
+
+        // For block-level tags, extract text
+        if (blockTags.has(tagName)) {
+          const text = $(el).text().trim();
+          if (text.length > 0) {
+            extractedText += text + "\n\n";
+          }
+          return;
+        }
+
+        // For div elements, only extract if they don't contain block children
+        if (tagName === "div") {
+          const hasBlockChild = $(el).find(Array.from(blockTags).join(", ")).length > 0;
+          if (!hasBlockChild) {
+            const text = $(el).text().trim();
+            if (text.length > 0) {
+              extractedText += text + "\n\n";
+            }
+          }
         }
       });
 
-      // If the above method failed to get enough text, fallback to simple text()
+      // Fallback: if extracted text is too short, use full text of content element
       if (extractedText.length < 200) {
         extractedText = contentElement.text();
       }
-      
+
       // Clean up whitespace but keep some newlines
       const cleanedText = extractedText
-        .replace(/[ \t]+/g, " ") // Replace multiple spaces/tabs with single space
-        .replace(/\n\s*\n/g, "\n\n") // Normalize multiple newlines
+        .replace(/[ \t]+/g, " ")
+        .replace(/\n\s*\n/g, "\n\n")
         .trim();
 
-      res.json({ text: cleanedText });
+      const paragraphCount = cleanedText.split(/\n\n+/).filter(p => p.trim()).length;
+
+      res.json({
+        text: cleanedText,
+        charCount: cleanedText.length,
+        paragraphCount
+      });
     } catch (error: any) {
       console.error("Error fetching URL:", error);
       res.status(500).json({ error: error.message });
@@ -103,19 +196,19 @@ async function startServer() {
     }
 
     try {
-      const model = "gemini-3-flash-preview";
-      const chunkSize = 6000;
-      const textChunks: string[] = [];
-      for (let i = 0; i < text.length; i += chunkSize) {
-        textChunks.push(text.substring(i, i + chunkSize));
-      }
+      const model = "gemini-2.0-flash";
+      const chunkSize = 12000;
+      const textChunks = splitIntoChunks(text, chunkSize);
 
       let combinedResult: any = {
         summary: "",
         writingStyleAnalysis: "",
         culturalContext: "",
         sentencePatterns: [],
-        tokens: []
+        tokens: [],
+        partialAnalysis: false,
+        analyzedChunks: 0,
+        totalChunks: textChunks.length
       };
 
       for (let i = 0; i < textChunks.length; i++) {
@@ -123,51 +216,73 @@ async function startServer() {
         const chunk = textChunks[i];
 
         if (i > 0) {
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          await new Promise(resolve => setTimeout(resolve, 5000));
         }
 
+        const tokenizationRules = `
+**CRITICAL - TOKEN GRANULARITY RULES (MUST FOLLOW EXACTLY):**
+- Each token MUST be exactly ONE of: a single word, a punctuation mark, a whitespace character, an idiom (熟語), or a set phrase (成語/慣用句).
+- A token's "text" field MUST NEVER contain more than 4 words (or 8 characters for CJK languages).
+- ABSOLUTELY FORBIDDEN: putting a full sentence, a clause, or a long phrase as a single token.
+- You MUST tokenize ALL text sequentially including every whitespace and punctuation character.
+
+**CORRECT tokenization examples:**
+
+English: "The quick brown fox jumped over the lazy dog."
+→ tokens: "The", " ", "quick", " ", "brown", " ", "fox", " ", "jumped", " ", "over", " ", "the", " ", "lazy", " ", "dog", "."
+
+Chinese: "他不但聪明而且勤奋。"
+→ tokens: "他", "不但", "聪明", "而且", "勤奋", "。"
+
+French: "Je suis allé au marché."
+→ tokens: "Je", " ", "suis", " ", "allé", " ", "au", " ", "marché", "."
+
+**WRONG (FORBIDDEN):**
+- ❌ "The quick brown fox jumped over the lazy dog." as ONE token
+- ❌ "他不但聪明而且勤奋" as ONE token
+- ❌ Any token containing a full sentence or clause`;
+
         const prompt = isFirst ? `
-          Analyze the following text (Part 1 of ${textChunks.length}) for a language learner who wants to achieve native-level understanding.
-          The text could be in any language (e.g., English, Spanish, French, Chinese, etc.).
+Analyze the following text (Part 1 of ${textChunks.length}) for a language learner who wants to achieve native-level understanding.
+The text could be in any language (e.g., English, Spanish, French, Chinese, Japanese, Korean, etc.).
 
-          **IMPORTANT INSTRUCTIONS:**
-          1. IGNORE website UI elements (e.g., "Share", "Save", "Watch", "Like", "Subscribe", "Menu", etc.) that are not part of the actual article content.
-          2. **STRICT WORD-LEVEL TOKENIZATION:** Every single token MUST be an individual word, a punctuation mark, or a whitespace character.
-             - **NEVER** group multiple words into a single token unless they form a strictly inseparable idiom (e.g., "by the way").
-             - **NEVER** include a full sentence, a phrase, or a clause in a single token.
-             - If you see a sentence like "The cat sat on the mat", you MUST provide tokens for "The", " ", "cat", " ", "sat", " ", "on", " ", "the", " ", "mat".
-          3. Provide a brief summary of the ENTIRE text in Japanese.
-          4. Provide a detailed "Writing Style Analysis" in Japanese for the entire text.
-          5. Provide a "Cultural & Contextual Background" in Japanese, explaining any cultural references, historical context, or societal norms mentioned or implied in the text.
-          6. Identify key "Sentence Patterns" or grammatical structures used in this part.
-          7. Segment this part into tokens sequentially (including ALL characters).
-          8. For each token (except whitespace/punctuation):
-             - Japanese translation. **If the language is Chinese, MUST include Pinyin (e.g., "こんにちは (nǐ hǎo)").**
-             - Detailed explanation. **CRITICAL: If the token is a proper noun, historical event, or cultural reference, provide a concise but comprehensive background explanation.**
-             - Dictionary form (lemma) if the word is inflected.
-             - Inflection details: Specify the EXACT conjugation or inflection used in the "type" field.
+**INSTRUCTIONS:**
+1. IGNORE website UI elements (e.g., "Share", "Save", "Watch", "Like", "Subscribe", "Menu", etc.) that are not part of the actual article content.
 
-          Text to analyze:
-          ${chunk}
-        ` : `
-          Analyze the following text (Part ${i + 1} of ${textChunks.length}) for a language learner.
+${tokenizationRules}
 
-          **IMPORTANT INSTRUCTIONS:**
-          1. IGNORE website UI elements (e.g., "Share", "Save", "Watch", etc.) that are not part of the actual article content.
-          2. **STRICT WORD-LEVEL TOKENIZATION:** Every single token MUST be an individual word, a punctuation mark, or a whitespace character.
-             - **NEVER** group multiple words into a single token unless they form a strictly inseparable idiom.
-             - **NEVER** include a full sentence, a phrase, or a clause in a single token.
-          3. Identify key "Sentence Patterns" or grammatical structures used in this part.
-          4. Segment this part into tokens sequentially (including ALL characters).
-          5. For each token (except whitespace/punctuation):
-             - Japanese translation. **If the language is Chinese, MUST include Pinyin.**
-             - Detailed explanation. **CRITICAL: Provide deep background for proper nouns, cultural references, or specialized terms.**
-             - Dictionary form (lemma).
-             - Inflection details: Specify the EXACT conjugation or inflection used in the "type" field.
+3. Provide a brief summary of the ENTIRE text in Japanese.
+4. Provide a detailed "Writing Style Analysis" in Japanese for the entire text.
+5. Provide a "Cultural & Contextual Background" in Japanese, explaining any cultural references, historical context, or societal norms mentioned or implied in the text.
+6. Identify key "Sentence Patterns" or grammatical structures used in this part.
+7. Segment this part into tokens sequentially (including ALL characters).
+8. For each token (except whitespace/punctuation):
+   - Japanese translation. **If the language is Chinese, MUST include Pinyin (e.g., "こんにちは (nǐ hǎo)").**
+   - Detailed explanation in Japanese. **CRITICAL: If the token is a proper noun, historical event, or cultural reference, provide a concise but comprehensive background explanation.**
+   - Dictionary form (lemma) if the word is inflected.
+   - Inflection details: Specify the EXACT conjugation or inflection used in the "type" field.
 
-          Text to analyze:
-          ${chunk}
-        `;
+Text to analyze:
+${chunk}
+` : `
+Analyze the following text (Part ${i + 1} of ${textChunks.length}) for a language learner.
+
+**INSTRUCTIONS:**
+1. IGNORE website UI elements that are not part of the actual article content.
+
+${tokenizationRules}
+
+3. Identify key "Sentence Patterns" or grammatical structures used in this part.
+4. Segment this part into tokens sequentially (including ALL characters).
+5. For each token (except whitespace/punctuation):
+   - Japanese translation. **If the language is Chinese, MUST include Pinyin.**
+   - Detailed explanation in Japanese. **CRITICAL: Provide deep background for proper nouns, cultural references, or specialized terms.**
+   - Dictionary form (lemma).
+   - Inflection details: Specify the EXACT conjugation or inflection used in the "type" field.
+
+Text to analyze:
+${chunk}
+`;
 
         const schema: any = {
           type: Type.OBJECT,
@@ -190,7 +305,7 @@ async function startServer() {
                 type: Type.OBJECT,
                 properties: {
                   id: { type: Type.STRING },
-                  text: { type: Type.STRING },
+                  text: { type: Type.STRING, description: "A single word, punctuation, whitespace, or idiom. NEVER a full sentence." },
                   translation: { type: Type.STRING },
                   explanation: { type: Type.STRING },
                   lemma: { type: Type.STRING },
@@ -218,14 +333,25 @@ async function startServer() {
           schema.required.push("summary", "writingStyleAnalysis", "culturalContext");
         }
 
-        const response = await withRetry(() => ai.models.generateContent({
-          model,
-          contents: [{ parts: [{ text: prompt }] }],
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: schema
+        let response;
+        try {
+          response = await withRetry(() => ai.models.generateContent({
+            model,
+            contents: [{ parts: [{ text: prompt }] }],
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: schema
+            }
+          }));
+        } catch (error: any) {
+          const msg = error?.message || "";
+          if ((msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED")) && !isFirst) {
+            console.warn(`Quota exhausted at chunk ${i}. Returning partial results.`);
+            combinedResult.partialAnalysis = true;
+            break;
           }
-        }));
+          throw error;
+        }
 
         try {
           const result = JSON.parse(response.text || "{}");
@@ -236,9 +362,12 @@ async function startServer() {
           }
           combinedResult.sentencePatterns.push(...(result.sentencePatterns || []));
           combinedResult.tokens.push(...(result.tokens || []));
+          combinedResult.analyzedChunks = i + 1;
         } catch (e) {
           console.error(`Failed to parse Gemini response for chunk ${i}:`, e);
           if (isFirst) throw new Error("Initial analysis failed");
+          combinedResult.partialAnalysis = true;
+          break;
         }
       }
 
