@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { Search, Globe, ChevronRight, ChevronLeft, Info, Book, History, MapPin, Loader2, X, PenTool, Layout, Quote } from "lucide-react";
+import { Search, Globe, ChevronRight, ChevronLeft, Info, Book, Loader2, X, PenTool, Layout, Quote } from "lucide-react";
 import { analyzeText } from "./services/geminiService";
 import { AnalysisResult, Token } from "./types";
 
@@ -302,7 +302,7 @@ export default function App() {
                             <div className="bg-stone-50 p-3 rounded-xl border border-stone-100">
                               <span className="font-mono font-medium text-emerald-700">{selectedToken.lemma}</span>
                               {selectedToken.inflection && (
-                                <div className="mt-2 pt-2 border-top border-stone-200/50">
+                                <div className="mt-2 pt-2 border-t border-stone-200/50">
                                   <span className="text-xs text-stone-500 block mb-1">{selectedToken.inflection.type}</span>
                                   <div className="flex flex-wrap gap-1">
                                     {selectedToken.inflection.table.map((form, i) => (
